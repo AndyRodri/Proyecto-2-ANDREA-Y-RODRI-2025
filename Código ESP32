@@ -1,579 +1,200 @@
-#include "main.h"
-#include <stdio.h>
-#include <string.h>
-
-/* =================== DEFINICIÓN DE CONSTANTES =================== */
-#define I2C_DEV_ADDR 0x42          // Dirección I2C del dispositivo esclavo (ESP32)
-#define CS_GPIO_Port GPIOB          // Puerto del pin Chip Select para SPI
-#define CS_Pin GPIO_PIN_6           // Pin de Chip Select
-
-/* =================== DECLARACIÓN DE HANDLERS ==================== */
-I2C_HandleTypeDef hi2c1;           // Manejador del bus I2C
-SPI_HandleTypeDef hspi1;           // Manejador del bus SPI
-UART_HandleTypeDef huart2;         // Manejador del puerto UART (comunicación con PC)
-
-/* =================== VARIABLES GLOBALES ========================= */
-char uartBuffer[64];               // Buffer para mensajes UART
-uint8_t potData[2];                // Datos recibidos desde el ESP32 por I2C (2 bytes)
-
-/* =================== PROTOTIPOS DE FUNCIONES ==================== */
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_I2C1_Init(void);
-void MenuPrincipal(void);
-void OpcionSPI(void);
-void OpcionI2C(void);
-void Error_Handler(void);
+#include <Arduino.h>
+#include <LiquidCrystal.h>
+#include "driver/i2c.h"
+#include "driver/spi_slave.h"
+#include "esp_heap_caps.h"
 
 /* ================================================================
- *                         FUNCIÓN PRINCIPAL
+ *                    CONFIGURACIÓN DE HARDWARE
  * ================================================================ */
-int main(void)
-{
-  /* Inicialización básica del microcontrolador */
-  HAL_Init();                      // Inicializa la HAL (Hardware Abstraction Layer)
-  SystemClock_Config();            // Configura el reloj del sistema
-  MX_GPIO_Init();                  // Inicializa los pines GPIO
-  MX_USART2_UART_Init();           // Inicializa la comunicación UART
-  MX_SPI1_Init();                  // Inicializa la comunicación SPI
-  MX_I2C1_Init();                  // Inicializa la comunicación I2C
 
-  /* Mensaje inicial en el monitor serial */
-  const char *msg =
-      "\r\n** Proyecto 2: Comunicacion Serial ***\r\n"
-      "Nucleo listo. Seleccione una opcion.\r\n";
-  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
+// ---------- Pines para I2C ----------
+#define I2C_SLAVE_SDA 21            // Pin SDA del ESP32
+#define I2C_SLAVE_SCL 22            // Pin SCL del ESP32
+#define I2C_SLAVE_NUM I2C_NUM_0     // Puerto I2C a usar (I2C0)
+#define I2C_SLAVE_ADDR 0x42         // Dirección I2C del ESP32 (coincide con la del STM32)
 
-  /* Bucle principal */
-  while (1)
-  {
-    MenuPrincipal();               // Muestra el menú principal continuamente
-  }
-}
+// ---------- Pines para SPI ----------
+#define SPI_MOSI 23
+#define SPI_MISO 19
+#define SPI_SCLK 18
+#define SPI_CS   5
+#define SPI_HOST_VSPI VSPI_HOST     // Bus SPI a utilizar
+
+// ---------- Configuración LCD ----------
+LiquidCrystal lcd(32, 33, 4, 16, 17, 15);  // LCD paralelo (pines RS, EN, D4, D5, D6, D7)
+
+// ---------- LEDs ----------
+const int ledPins[3] = {25, 26, 27};       // Pines conectados a LEDs
+String ultimoLED = "NA";                   // Último LED encendido
+
+// ---------- Potenciómetro ----------
+const int potPin = 34;                     // Entrada analógica del potenciómetro
 
 /* ================================================================
- *                      MENÚ PRINCIPAL POR UART
+ *                 INICIALIZACIÓN DEL MÓDULO SPI (ESCLAVO)
  * ================================================================ */
-void MenuPrincipal(void)
-{
-  uint8_t opcion = 0;
+static void spi_slave_init() {
+  spi_bus_config_t buscfg = {};
+  buscfg.mosi_io_num = SPI_MOSI;
+  buscfg.miso_io_num = SPI_MISO;
+  buscfg.sclk_io_num = SPI_SCLK;
+  buscfg.quadwp_io_num = -1;   // Pines no usados
+  buscfg.quadhd_io_num = -1;
 
-  const char *menu =
-      "\r\n===== MENU PRINCIPAL =====\r\n"
-      "1. Controlar LEDs (SPI)\r\n"
-      "2. Leer Potenciometro (I2C)\r\n"
-      "Seleccione una opcion: ";
+  spi_slave_interface_config_t slvcfg = {};
+  slvcfg.spics_io_num = SPI_CS;   // Pin CS controlado por el STM32
+  slvcfg.flags = 0;
+  slvcfg.queue_size = 3;          // Máximo de transacciones en cola
+  slvcfg.mode = 0;                // Modo SPI (CPOL=0, CPHA=0)
 
-  /* Enviar el menú al monitor serial */
-  HAL_UART_Transmit(&huart2, (uint8_t *)menu, strlen(menu), HAL_MAX_DELAY);
-
-  /* Esperar la entrada del usuario */
-  while (1)
-  {
-    HAL_UART_Receive(&huart2, &opcion, 1, HAL_MAX_DELAY);
-
-    /* Ignorar saltos de línea (Enter) */
-    if (opcion == '\r' || opcion == '\n')
-      continue;
-
-    /* Eco de la tecla presionada */
-    HAL_UART_Transmit(&huart2, &opcion, 1, HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
-
-    /* Selección de opción */
-    if (opcion == '1')
-    {
-      OpcionSPI();                 // Control de LEDs
-      break;
-    }
-    else if (opcion == '2')
-    {
-      OpcionI2C();                 // Lectura de potenciómetro
-      break;
-    }
-    else
-    {
-      /* Mensaje de advertencia */
-      const char *warn = "\r\nOpcion invalida. Intente de nuevo.\r\n";
-      HAL_UART_Transmit(&huart2, (uint8_t *)warn, strlen(warn), HAL_MAX_DELAY);
-    }
-  }
-}
-
-/* ================================================================
- *                     OPCIÓN 1: COMUNICACIÓN SPI
- * ================================================================ */
-void OpcionSPI(void)
-{
-  const char *prompt = "\r\nIngrese numero de LED (1, 2 o 3): ";
-  HAL_UART_Transmit(&huart2, (uint8_t *)prompt, strlen(prompt), HAL_MAX_DELAY);
-
-  uint8_t led_char = 0;
-  uint8_t spiPacket[1];
-
-  while (1)
-  {
-    HAL_UART_Receive(&huart2, &led_char, 1, HAL_MAX_DELAY);
-
-    if (led_char == '\r' || led_char == '\n')
-      continue; // Ignorar Enter
-
-    /* Eco en la terminal */
-    HAL_UART_Transmit(&huart2, &led_char, 1, HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
-
-    /* Validar entrada (1-3) */
-    if (led_char >= '1' && led_char <= '3')
-    {
-      uint8_t led_num = (uint8_t)(led_char - '0'); // Conversión ASCII → número
-      spiPacket[0] = led_num;
-
-      /* Enviar byte por SPI al ESP32 */
-      HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET); // CS = 0
-      HAL_SPI_Transmit(&hspi1, spiPacket, 1, HAL_MAX_DELAY);   // Transmisión
-      HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);   // CS = 1
-
-      sprintf(uartBuffer, "\r\nComando SPI enviado: LED %d\r\n", led_num);
-      HAL_UART_Transmit(&huart2, (uint8_t *)uartBuffer, strlen(uartBuffer), HAL_MAX_DELAY);
-      break;
-    }
-    else
-    {
-      const char *err = "Valor invalido. Ingrese 1, 2 o 3: ";
-      HAL_UART_Transmit(&huart2, (uint8_t *)err, strlen(err), HAL_MAX_DELAY);
-    }
-  }
-}
-
-/* ================================================================
- *                    OPCIÓN 2: COMUNICACIÓN I2C
- * ================================================================ */
-void OpcionI2C(void)
-{
-  /* Recibir 2 bytes desde el dispositivo I2C (ESP32) */
-  HAL_StatusTypeDef ret =
-      HAL_I2C_Master_Receive(&hi2c1, (I2C_DEV_ADDR << 1), potData, 2, HAL_MAX_DELAY);
-
-  /* Si la comunicación fue exitosa */
-  if (ret == HAL_OK)
-  {
-    uint16_t potValue = ((uint16_t)potData[0] << 8) | potData[1]; // Combinar bytes
-    uint32_t mv = (3300UL * potValue) / 4095UL;                   // Conversión a milivoltios
-
-    sprintf(uartBuffer, "\r\nLectura Pot: %u bits (%lu mV)\r\n",
-            potValue, (unsigned long)mv);
-  }
+  // Inicializar el bus SPI en modo esclavo
+  esp_err_t ret = spi_slave_initialize(SPI_HOST_VSPI, &buscfg, &slvcfg, SPI_DMA_CH_AUTO);
+  if (ret == ESP_OK)
+    Serial.println("SPI slave init OK");
   else
-  {
-    sprintf(uartBuffer, "\r\nError de comunicacion I2C\r\n");
-  }
-
-  /* Mostrar resultado en UART */
-  HAL_UART_Transmit(&huart2, (uint8_t *)uartBuffer, strlen(uartBuffer), HAL_MAX_DELAY);
+    Serial.printf("SPI slave init error: %d\n", ret);
 }
 
 /* ================================================================
- *              CONFIGURACIÓN DE PERIFÉRICOS (MX_*)
+ *                 INICIALIZACIÓN DEL MÓDULO I2C (ESCLAVO)
  * ================================================================ */
+static void i2c_slave_init() {
+  i2c_config_t conf_slave = {};
+  conf_slave.mode = I2C_MODE_SLAVE;
+  conf_slave.sda_io_num = I2C_SLAVE_SDA;
+  conf_slave.scl_io_num = I2C_SLAVE_SCL;
+  conf_slave.sda_pullup_en = GPIO_PULLUP_ENABLE;
+  conf_slave.scl_pullup_en = GPIO_PULLUP_ENABLE;
+  conf_slave.slave.slave_addr = I2C_SLAVE_ADDR;
+  conf_slave.slave.addr_10bit_en = 0;  // Dirección de 7 bits
 
-/* ---------- I2C1 ---------- */
-static void MX_I2C1_Init(void)
-{
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;               // Velocidad estándar: 100 kHz
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  i2c_param_config(I2C_SLAVE_NUM, &conf_slave);
+  i2c_driver_install(I2C_SLAVE_NUM, conf_slave.mode, 128, 128, 0);
 
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-    Error_Handler();
-}
-
-/* ---------- SPI1 ---------- */
-static void MX_SPI1_Init(void)
-{
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;            // Modo maestro
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;  // Doble línea: MOSI/MISO
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;      // 8 bits por transferencia
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;    // Reloj en bajo cuando inactivo
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;        // Muestra en primer flanco
-  hspi1.Init.NSS = SPI_NSS_SOFT;                // NSS controlado por software
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32; // Frecuencia de SPI
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;       // Enviar bit más significativo primero
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-    Error_Handler();
-}
-
-/* ---------- UART2 ---------- */
-static void MX_USART2_UART_Init(void)
-{
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;                // Velocidad de comunicación
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-    Error_Handler();
-}
-
-/* ---------- GPIO ---------- */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_GPIOB_CLK_ENABLE();                // Habilitar reloj del puerto B
-
-  /* Configurar pin CS como salida */
-  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(CS_GPIO_Port, &GPIO_InitStruct);
+  Serial.println("I2C slave init OK");
 }
 
 /* ================================================================
- *                   CONFIGURACIÓN DEL SISTEMA DE RELOJ
+ *                   PROCESAR COMANDO SPI (CONTROL DE LEDS)
  * ================================================================ */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+static void process_led_command(uint8_t cmd) {
+  // Apagar todos los LEDs primero
+  for (int i = 0; i < 3; i++)
+    digitalWrite(ledPins[i], LOW);
 
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-
-  /* Configurar el oscilador HSI (interno) y el PLL */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
-  HAL_RCC_OscConfig(&RCC_OscInitStruct);
-
-  /* Configurar los buses AHB, APB1, APB2 */
-  RCC_ClkInitStruct.ClockType =
-      RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
-}
-
-/* ================================================================
- *                   MANEJO DE ERRORES
- * ================================================================ */
-void Error_Handler(void)
-{
-  __disable_irq();
-  while (1)
-  {
-    // Bucle infinito para indicar error
-  }
-}
-#include "main.h"
-#include <stdio.h>
-#include <string.h>
-
-/* =================== DEFINICIÓN DE CONSTANTES =================== */
-#define I2C_DEV_ADDR 0x42          // Dirección I2C del dispositivo esclavo (ESP32)
-#define CS_GPIO_Port GPIOB          // Puerto del pin Chip Select para SPI
-#define CS_Pin GPIO_PIN_6           // Pin de Chip Select
-
-/* =================== DECLARACIÓN DE HANDLERS ==================== */
-I2C_HandleTypeDef hi2c1;           // Manejador del bus I2C
-SPI_HandleTypeDef hspi1;           // Manejador del bus SPI
-UART_HandleTypeDef huart2;         // Manejador del puerto UART (comunicación con PC)
-
-/* =================== VARIABLES GLOBALES ========================= */
-char uartBuffer[64];               // Buffer para mensajes UART
-uint8_t potData[2];                // Datos recibidos desde el ESP32 por I2C (2 bytes)
-
-/* =================== PROTOTIPOS DE FUNCIONES ==================== */
-void SystemClock_Config(void);
-static void MX_GPIO_Init(void);
-static void MX_USART2_UART_Init(void);
-static void MX_SPI1_Init(void);
-static void MX_I2C1_Init(void);
-void MenuPrincipal(void);
-void OpcionSPI(void);
-void OpcionI2C(void);
-void Error_Handler(void);
-
-/* ================================================================
- *                         FUNCIÓN PRINCIPAL
- * ================================================================ */
-int main(void)
-{
-  /* Inicialización básica del microcontrolador */
-  HAL_Init();                      // Inicializa la HAL (Hardware Abstraction Layer)
-  SystemClock_Config();            // Configura el reloj del sistema
-  MX_GPIO_Init();                  // Inicializa los pines GPIO
-  MX_USART2_UART_Init();           // Inicializa la comunicación UART
-  MX_SPI1_Init();                  // Inicializa la comunicación SPI
-  MX_I2C1_Init();                  // Inicializa la comunicación I2C
-
-  /* Mensaje inicial en el monitor serial */
-  const char *msg =
-      "\r\n** Proyecto 2: Comunicacion Serial ***\r\n"
-      "Nucleo listo. Seleccione una opcion.\r\n";
-  HAL_UART_Transmit(&huart2, (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
-
-  /* Bucle principal */
-  while (1)
-  {
-    MenuPrincipal();               // Muestra el menú principal continuamente
+  // Encender el LED correspondiente
+  if (cmd >= 1 && cmd <= 3) {
+    int idx = cmd - 1;
+    digitalWrite(ledPins[idx], HIGH);
+    ultimoLED = String(cmd);
+    Serial.printf("LED %d ON\n", cmd);
+  } else {
+    ultimoLED = "NA";
+    Serial.printf("Invalid LED cmd: %d\n", cmd);
   }
 }
 
 /* ================================================================
- *                      MENÚ PRINCIPAL POR UART
+ *                     TAREA SPI (HILO INDEPENDIENTE)
+ * ================================================================
+ * Esta tarea corre en segundo plano.
+ * - Espera datos enviados desde el STM32 (modo esclavo SPI)
+ * - Cada byte recibido representa el número de LED a encender.
  * ================================================================ */
-void MenuPrincipal(void)
-{
-  uint8_t opcion = 0;
+static void spi_task(void *arg) {
+  // Buffer DMA-capable (alineado a 4 bytes)
+  static uint8_t rxdata[4] _attribute_((aligned(4)));
 
-  const char *menu =
-      "\r\n===== MENU PRINCIPAL =====\r\n"
-      "1. Controlar LEDs (SPI)\r\n"
-      "2. Leer Potenciometro (I2C)\r\n"
-      "Seleccione una opcion: ";
+  spi_slave_transaction_t t;
+  memset(&t, 0, sizeof(t));
+  t.length = 8;              // 8 bits (1 byte)
+  t.tx_buffer = NULL;        // No se envía respuesta
+  t.rx_buffer = rxdata;      // Donde se guarda el byte recibido
 
-  /* Enviar el menú al monitor serial */
-  HAL_UART_Transmit(&huart2, (uint8_t *)menu, strlen(menu), HAL_MAX_DELAY);
+  while (true) {
+    memset(rxdata, 0, sizeof(rxdata));
 
-  /* Esperar la entrada del usuario */
-  while (1)
-  {
-    HAL_UART_Receive(&huart2, &opcion, 1, HAL_MAX_DELAY);
+    // Esperar transacción desde el maestro (STM32)
+    esp_err_t ret = spi_slave_transmit(SPI_HOST_VSPI, &t, portMAX_DELAY);
 
-    /* Ignorar saltos de línea (Enter) */
-    if (opcion == '\r' || opcion == '\n')
-      continue;
-
-    /* Eco de la tecla presionada */
-    HAL_UART_Transmit(&huart2, &opcion, 1, HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
-
-    /* Selección de opción */
-    if (opcion == '1')
-    {
-      OpcionSPI();                 // Control de LEDs
-      break;
+    if (ret == ESP_OK) {
+      uint8_t cmd = rxdata[0];
+      if (cmd != 0) {
+        Serial.printf("SPI RX: %d\n", cmd);
+        process_led_command(cmd);
+      }
+    } else {
+      Serial.printf("SPI error: %d\n", ret);
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
-    else if (opcion == '2')
-    {
-      OpcionI2C();                 // Lectura de potenciómetro
-      break;
-    }
-    else
-    {
-      /* Mensaje de advertencia */
-      const char *warn = "\r\nOpcion invalida. Intente de nuevo.\r\n";
-      HAL_UART_Transmit(&huart2, (uint8_t *)warn, strlen(warn), HAL_MAX_DELAY);
-    }
+
+    vTaskDelay(pdMS_TO_TICKS(20)); // Pequeña espera antes de la siguiente iteración
   }
 }
 
 /* ================================================================
- *                     OPCIÓN 1: COMUNICACIÓN SPI
+ *                           SETUP
  * ================================================================ */
-void OpcionSPI(void)
-{
-  const char *prompt = "\r\nIngrese numero de LED (1, 2 o 3): ";
-  HAL_UART_Transmit(&huart2, (uint8_t *)prompt, strlen(prompt), HAL_MAX_DELAY);
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\nESP32 start");
 
-  uint8_t led_char = 0;
-  uint8_t spiPacket[1];
-
-  while (1)
-  {
-    HAL_UART_Receive(&huart2, &led_char, 1, HAL_MAX_DELAY);
-
-    if (led_char == '\r' || led_char == '\n')
-      continue; // Ignorar Enter
-
-    /* Eco en la terminal */
-    HAL_UART_Transmit(&huart2, &led_char, 1, HAL_MAX_DELAY);
-    HAL_UART_Transmit(&huart2, (uint8_t *)"\r\n", 2, HAL_MAX_DELAY);
-
-    /* Validar entrada (1-3) */
-    if (led_char >= '1' && led_char <= '3')
-    {
-      uint8_t led_num = (uint8_t)(led_char - '0'); // Conversión ASCII → número
-      spiPacket[0] = led_num;
-
-      /* Enviar byte por SPI al ESP32 */
-      HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_RESET); // CS = 0
-      HAL_SPI_Transmit(&hspi1, spiPacket, 1, HAL_MAX_DELAY);   // Transmisión
-      HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);   // CS = 1
-
-      sprintf(uartBuffer, "\r\nComando SPI enviado: LED %d\r\n", led_num);
-      HAL_UART_Transmit(&huart2, (uint8_t *)uartBuffer, strlen(uartBuffer), HAL_MAX_DELAY);
-      break;
-    }
-    else
-    {
-      const char *err = "Valor invalido. Ingrese 1, 2 o 3: ";
-      HAL_UART_Transmit(&huart2, (uint8_t *)err, strlen(err), HAL_MAX_DELAY);
-    }
+  /* ---------- Configurar LEDs ---------- */
+  for (int i = 0; i < 3; i++) {
+    pinMode(ledPins[i], OUTPUT);
+    digitalWrite(ledPins[i], LOW);
   }
+
+  /* ---------- Configurar LCD ---------- */
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.print("ESP32 Ready");
+
+  /* ---------- Inicializar SPI e I2C ---------- */
+  spi_slave_init();
+  i2c_slave_init();
+
+  /* ---------- Crear tarea SPI ---------- */
+  xTaskCreate(spi_task, "spi_task", 4096, NULL, 10, NULL);
 }
 
 /* ================================================================
- *                    OPCIÓN 2: COMUNICACIÓN I2C
+ *                            LOOP PRINCIPAL
+ * ================================================================
+ * Se ejecuta constantemente y:
+ * 1. Lee el valor del potenciómetro.
+ * 2. Lo envía al STM32 por I2C (2 bytes).
+ * 3. Actualiza el LCD con voltaje, bits y LED activo.
  * ================================================================ */
-void OpcionI2C(void)
-{
-  /* Recibir 2 bytes desde el dispositivo I2C (ESP32) */
-  HAL_StatusTypeDef ret =
-      HAL_I2C_Master_Receive(&hi2c1, (I2C_DEV_ADDR << 1), potData, 2, HAL_MAX_DELAY);
+void loop() {
+  /* ---------- Lectura del potenciómetro ---------- */
+  int val = analogRead(potPin);                    // 0 - 4095
+  float voltage = (val / 4095.0f) * 3.3f;          // Conversión a voltios
 
-  /* Si la comunicación fue exitosa */
-  if (ret == HAL_OK)
-  {
-    uint16_t potValue = ((uint16_t)potData[0] << 8) | potData[1]; // Combinar bytes
-    uint32_t mv = (3300UL * potValue) / 4095UL;                   // Conversión a milivoltios
+  /* ---------- Enviar lectura al STM32 (I2C) ---------- */
+  uint8_t data[2];
+  data[0] = (uint8_t)(val >> 8);                   // Parte alta
+  data[1] = (uint8_t)(val & 0xFF);                 // Parte baja
+  i2c_slave_write_buffer(I2C_SLAVE_NUM, data, 2, 100 / portTICK_PERIOD_MS);
 
-    sprintf(uartBuffer, "\r\nLectura Pot: %u bits (%lu mV)\r\n",
-            potValue, (unsigned long)mv);
-  }
-  else
-  {
-    sprintf(uartBuffer, "\r\nError de comunicacion I2C\r\n");
-  }
+  /* ---------- Actualizar LCD ---------- */
+  lcd.setCursor(0, 0);
+  lcd.print("V:");
+  lcd.setCursor(2, 0);
+  lcd.print(String(voltage, 2) + "V   ");
 
-  /* Mostrar resultado en UART */
-  HAL_UART_Transmit(&huart2, (uint8_t *)uartBuffer, strlen(uartBuffer), HAL_MAX_DELAY);
+  lcd.setCursor(0, 1);
+  lcd.print("Bits:");
+  lcd.setCursor(6, 1);
+  lcd.print(val);
+  lcd.print("   ");
+
+  lcd.setCursor(12, 0);
+  lcd.print("LED:");
+  lcd.setCursor(12, 1);
+  lcd.print(ultimoLED + " ");
+
+  delay(200);  // Refresco de la pantalla
 }
-
-/* ================================================================
- *              CONFIGURACIÓN DE PERIFÉRICOS (MX_*)
- * ================================================================ */
-
-/* ---------- I2C1 ---------- */
-static void MX_I2C1_Init(void)
-{
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;               // Velocidad estándar: 100 kHz
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-    Error_Handler();
-}
-
-/* ---------- SPI1 ---------- */
-static void MX_SPI1_Init(void)
-{
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;            // Modo maestro
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;  // Doble línea: MOSI/MISO
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;      // 8 bits por transferencia
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;    // Reloj en bajo cuando inactivo
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;        // Muestra en primer flanco
-  hspi1.Init.NSS = SPI_NSS_SOFT;                // NSS controlado por software
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32; // Frecuencia de SPI
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;       // Enviar bit más significativo primero
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-    Error_Handler();
-}
-
-/* ---------- UART2 ---------- */
-static void MX_USART2_UART_Init(void)
-{
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;                // Velocidad de comunicación
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-    Error_Handler();
-}
-
-/* ---------- GPIO ---------- */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  __HAL_RCC_GPIOB_CLK_ENABLE();                // Habilitar reloj del puerto B
-
-  /* Configurar pin CS como salida */
-  HAL_GPIO_WritePin(CS_GPIO_Port, CS_Pin, GPIO_PIN_SET);
-  GPIO_InitStruct.Pin = CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(CS_GPIO_Port, &GPIO_InitStruct);
-}
-
-/* ================================================================
- *                   CONFIGURACIÓN DEL SISTEMA DE RELOJ
- * ================================================================ */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-
-  /* Configurar el oscilador HSI (interno) y el PLL */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
-  HAL_RCC_OscConfig(&RCC_OscInitStruct);
-
-  /* Configurar los buses AHB, APB1, APB2 */
-  RCC_ClkInitStruct.ClockType =
-      RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-  HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
-}
-
-/* ================================================================
- *                   MANEJO DE ERRORES
- * ================================================================ */
-void Error_Handler(void)
-{
-  __disable_irq();
-  while (1)
-  {
-    // Bucle infinito para indicar error
-  }
-}
-
